@@ -31,6 +31,11 @@ en `SERVIDOR_SALAS` dentro de `autoloads/Net.gd` del juego (con `wss://` delante
 
 ## Límites de seguridad
 
-- Códigos de 6 letras al azar; un máximo de 12 intentos de unirse por minuto y por IP.
+- Códigos de 6 letras al azar; un máximo de 12 intentos de unirse por minuto y por IP
+  (la IP es la que añade el proxy de Render, que no se puede falsificar).
+- Como mucho 20 conexiones abiertas y 5 salas nuevas por minuto por IP; 2000 salas en total.
+- Si el anfitrión se va (o se despide al cerrar el juego), la sala se cierra al instante.
+  Si se le cae la conexión, el servidor lo nota en unos 20 segundos.
+- Al cargar una partida, el anfitrión puede pedir su código de antes y se le da si está libre.
 - 4 jugadores por sala; mensajes de hasta 512 KB y 120 por segundo por conexión.
 - Las salas se cierran cuando sale el anfitrión o a las 12 horas.

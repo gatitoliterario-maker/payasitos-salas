@@ -4,7 +4,9 @@
 //
 // Protocolo (WebSocket):
 //   Texto (JSON), control:
-//     -> {"op":"crear","v":1}              <- {"op":"sala","codigo":"ABC123","id":1}
+//     -> {"op":"crear","v":1,"codigo":"ABC123"?} <- {"op":"sala","codigo":"ABC123","id":1}
+//        (si se pide un código y está libre, se usa: así al cargar una partida vale la invitación de antes)
+//     -> {"op":"cerrar"}  (el anfitrión se va: la sala se cierra al instante y se echa a todos)
 //     -> {"op":"unirse","codigo":"ABC123"} <- {"op":"dentro","id":N}   (y al anfitrión: {"op":"llega","id":N})
 //     -> {"op":"echar","id":N}  (solo el anfitrión)
 //                                          <- {"op":"sale","id":N}
@@ -25,9 +27,15 @@ const VIDA_SALA_MS = 12 * 60 * 60 * 1000;
 const INTENTOS_UNIRSE = 12;              // por IP y minuto: adivinar códigos no sale a cuenta
 const ALFABETO = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";  // sin letras ambiguas
 const LARGO_CODIGO = 6;
+const LATIDO_MS = 10_000;                // cada cuánto se comprueba que cada conexión sigue viva
+const MAX_CONEXIONES_IP = 20;            // una casa con varios jugadores cabe de sobra
+const MAX_SALAS_IP_MIN = 5;              // crear salas sin parar no sale a cuenta
+const MAX_SALAS = 2000;
 
 const salas = new Map();      // codigo -> {codigo, anfitrion, jugadores: Map(id -> ws), creada}
 const intentos = new Map();   // ip -> {n, desde}
+const creadas = new Map();    // ip -> {n, desde}
+const conexiones = new Map(); // ip -> número de conexiones abiertas
 
 function nuevoCodigo() {
   for (;;) {
@@ -54,18 +62,39 @@ function echar(ws, motivo) {
   ws.close(4000, motivo);
 }
 
+// IP real de quien se conecta. Render va detrás de Cloudflare, que pone cf-connecting-ip
+// (no se puede falsificar). Si no está, la ÚLTIMA de x-forwarded-for (la añade el proxy); las
+// de delante las puede inventar quien se conecta.
 function ipDe(req) {
+  for (const h of ["cf-connecting-ip", "true-client-ip"]) {
+    const v = req.headers[h];
+    if (v) return String(v).trim();
+  }
   const fwd = req.headers["x-forwarded-for"];
-  return (fwd ? String(fwd).split(",")[0] : req.socket.remoteAddress || "").trim();
+  if (fwd) {
+    const partes = String(fwd).split(",").map((x) => x.trim()).filter(Boolean);
+    if (partes.length) return partes[partes.length - 1];
+  }
+  return (req.socket.remoteAddress || "").trim();
+}
+
+function contar(mapa, ip, maximo) {
+  const ahora = Date.now();
+  const r = mapa.get(ip) || { n: 0, desde: ahora };
+  if (ahora - r.desde > 60_000) { r.n = 0; r.desde = ahora; }
+  r.n++;
+  mapa.set(ip, r);
+  return r.n <= maximo;
 }
 
 function puedeIntentar(ip) {
-  const ahora = Date.now();
-  const r = intentos.get(ip) || { n: 0, desde: ahora };
-  if (ahora - r.desde > 60_000) { r.n = 0; r.desde = ahora; }
-  r.n++;
-  intentos.set(ip, r);
-  return r.n <= INTENTOS_UNIRSE;
+  return contar(intentos, ip, INTENTOS_UNIRSE);
+}
+
+function codigoValido(c) {
+  if (typeof c !== "string" || c.length !== LARGO_CODIGO) return false;
+  for (const ch of c) if (!ALFABETO.includes(ch)) return false;
+  return true;
 }
 
 function cerrarSala(sala, motivo) {
@@ -77,6 +106,11 @@ function cerrarSala(sala, motivo) {
 }
 
 function salir(ws) {
+  if (!ws.contado) {
+    ws.contado = true;
+    const n = (conexiones.get(ws.ip) || 1) - 1;
+    if (n <= 0) conexiones.delete(ws.ip); else conexiones.set(ws.ip, n);
+  }
   const sala = ws.sala;
   if (!sala) return;
   ws.sala = null;
@@ -94,6 +128,12 @@ function salir(ws) {
 
 // Respuesta HTTP: la usa el juego para despertar al servidor y comprobar que está vivo.
 const servidor = http.createServer((req, res) => {
+  // /quien: devuelve la IP que el servidor cree que tienes (solo a ti), para comprobar los límites.
+  if (req.url === "/quien") {
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    res.end(ipDe(req) + "\n");
+    return;
+  }
   res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" });
   res.end("payasitos-salas ok " + salas.size + "\n");
 });
@@ -102,6 +142,14 @@ const wss = new WebSocketServer({ server: servidor, maxPayload: MAX_MENSAJE });
 
 wss.on("connection", (ws, req) => {
   ws.ip = ipDe(req);
+  ws.contado = false;
+  const abiertas = (conexiones.get(ws.ip) || 0) + 1;
+  conexiones.set(ws.ip, abiertas);
+  if (abiertas > MAX_CONEXIONES_IP) {
+    ws.contado = true;
+    conexiones.set(ws.ip, abiertas - 1);
+    return echar(ws, "demasiadas_conexiones");
+  }
   ws.sala = null;
   ws.id = 0;
   ws.vivo = true;
@@ -136,7 +184,11 @@ wss.on("connection", (ws, req) => {
     try { m = JSON.parse(datos.toString()); } catch { return echar(ws, "mensaje_raro"); }
     if (m.op === "crear") {
       if (ws.sala) return;
-      const sala = { codigo: nuevoCodigo(), jugadores: new Map(), creada: Date.now() };
+      if (salas.size >= MAX_SALAS) return echar(ws, "servidor_lleno");
+      if (!contar(creadas, ws.ip, MAX_SALAS_IP_MIN)) return echar(ws, "espera_un_minuto");
+      const pedido = String(m.codigo || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const codigo = codigoValido(pedido) && !salas.has(pedido) ? pedido : nuevoCodigo();
+      const sala = { codigo, jugadores: new Map(), creada: Date.now() };
       ws.id = 1;
       ws.sala = sala;
       sala.jugadores.set(1, ws);
@@ -154,6 +206,14 @@ wss.on("connection", (ws, req) => {
       sala.jugadores.set(ws.id, ws);
       enviar(ws, { op: "dentro", id: ws.id });
       enviar(sala.jugadores.get(1), { op: "llega", id: ws.id });
+    } else if (m.op === "cerrar") {
+      // El anfitrión se despide: sala cerrada ya, sin esperar a que se corte la conexión.
+      if (ws.sala && ws.id === 1) {
+        const sala = ws.sala;
+        ws.sala = null;
+        cerrarSala(sala, "anfitrion_salio");
+      }
+      ws.close(1000, "adios");
     } else if (m.op === "echar") {
       if (!ws.sala || ws.id !== 1) return;
       const otro = ws.sala.jugadores.get(Number(m.id));
@@ -176,10 +236,12 @@ setInterval(() => {
   for (const sala of salas.values()) {
     if (ahora - sala.creada > VIDA_SALA_MS) cerrarSala(sala, "sala_caducada");
   }
-  for (const [ip, r] of intentos) {
-    if (ahora - r.desde > 120_000) intentos.delete(ip);
+  for (const mapa of [intentos, creadas]) {
+    for (const [ip, r] of mapa) {
+      if (ahora - r.desde > 120_000) mapa.delete(ip);
+    }
   }
-}, 25_000);
+}, LATIDO_MS);
 
 servidor.listen(PUERTO, () => {
   console.log("Servidor de salas escuchando en el puerto " + PUERTO);
