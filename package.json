@@ -1,0 +1,16 @@
+{
+  "name": "payasitos-salas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Servidor de salas de Payasitos Estelares: junta a los jugadores y les pasa los mensajes.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}
